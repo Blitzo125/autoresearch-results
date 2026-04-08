@@ -1,0 +1,23 @@
+commit	val_bpb	artifact_mb	memory_gb	status	description
+c2ae6d8	1.374486	11.96	10.0	keep	baseline: 9L 512d GQA-4kv tied-embed relu^2 no sliding window
+b670d49	1.341303	11.99	10.0	keep	GPTQ-lite calibrated clipping + sliding window eval stride=256
+2fd5ab8	1.356047	11.98	10.0	discard	XSA-4 + LN Scale + Partial RoPE(16/64) — LN Scale hurt short training
+c906a55	1.339942	11.90	10.0	keep	XSA last-4 only (no LN Scale no Partial RoPE)
+5ecafdf	1.331524	14.10	10.0	keep	fix warmdown_iters 1200->150 (was training always in decay)
+8af5346	1.273445	15.40	10.6	keep	SWA over 150 warmdown steps — massive gain
+1e0f1ef	1.272626	15.31	10.6	keep	warmdown_iters 150->300 for more SWA steps
+6423b63	1.271569	15.33	10.6	keep	partial RoPE 16/64 dims (content-based dims)
+d60ec88	1.283770	14.81	11.4	discard	10L x 480d (deeper+narrower) — worse than 9L x 512d
+702e183	1.270215	15.94	10.7	keep	BigramHashEmbedding 4096x128 adds bigram context
+602764a	1.270304	15.92	10.7	discard	SmearGate (no effect vs exp10)
+369fe74	1.268031	16.31	10.7	keep	matrix_lr 0.04->0.05 (15.61MB binary, under 16MB binary limit)
+ca38703	1.286982	14.73	12.9	discard	int6 quant + 11L — fewer steps (1426 vs 1774) hurt
+dfd72d5	1.272584	15.36	11.9	discard	9L int6 + mlp_mult=3 — int6 noise > capacity gain (1606 steps)
+33e46fb	1.274784	16.30	10.7	discard	seq_len 2048 — fewer steps (1481 at 405ms) outweigh context gain
+91703c2	1.274420	15.93	10.7	discard	muon_momentum 0.99 — worse than default
+c37f34f	1.268579	16.36	10.7	discard	EMA decay=0.99 — slightly worse than equal-weight SWA
+dc1543f	1.270777	16.32	10.7	discard	warmdown_iters 300->400 — fewer full-LR steps outweigh extra SWA
+83cbaea	1.283253	16.40	10.7	discard	SiLU activation — worse than relu^2 (sparse activations better for quant)
+0f9aac0	1.268808	16.47	10.7	discard	matrix_lr 0.05->0.06 — slightly worse, 0.05 seems optimal
+5a1308d	1.269406	16.40	10.7	discard	LZMA9 instead of zlib — compresses worse for int8 weights
+a29a26c	1.267522	16.35	10.7	keep	XSA on all 9 layers (was last-4) — novel contribution from ref

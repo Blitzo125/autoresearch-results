@@ -1,0 +1,422 @@
+diff --git a/train.py b/train.py
+index 651beb2..60d5505 100644
+--- a/train.py
++++ b/train.py
+@@ -49,10 +49,15 @@ class Hyperparameters:
+     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
+     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
+     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
++    eval_stride = int(os.environ.get("EVAL_STRIDE", 256))
++    xsa_last_n = int(os.environ.get("XSA_LAST_N", 9))
++    partial_rope_dims = int(os.environ.get("PARTIAL_ROPE_DIMS", 16))
++    bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 4096))
++    bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
+ 
+     # Training length.
+     iterations = int(os.environ.get("ITERATIONS", 20000))
+-    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
++    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 300))
+     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
+     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
+     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
+@@ -75,7 +80,7 @@ class Hyperparameters:
+     head_lr = float(os.environ.get("HEAD_LR", 0.008))
+     tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.05))
+     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
+-    matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
++    matrix_lr = float(os.environ.get("MATRIX_LR", 0.05))
+     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
+     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
+     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
+@@ -84,7 +89,7 @@ class Hyperparameters:
+     beta1 = float(os.environ.get("BETA1", 0.9))
+     beta2 = float(os.environ.get("BETA2", 0.95))
+     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
+-    grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
++    grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.3))
+ 
+ # -----------------------------
+ # MUON OPTIMIZER 
+@@ -277,6 +282,76 @@ def eval_val(
+     model.train()
+     return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
+ 
++
++def eval_val_sliding(
++    args: Hyperparameters,
++    base_model: nn.Module,
++    rank: int,
++    world_size: int,
++    device: torch.device,
++    val_tokens: Tensor,
++    base_bytes_lut: Tensor,
++    has_leading_space_lut: Tensor,
++    is_boundary_token_lut: Tensor,
++    stride: int | None = None,
++) -> tuple[float, float]:
++    """Sliding-window eval: each scored token has seq_len-stride tokens of prior context.
++
++    Fully vectorized per batch: one forward pass + masked cross_entropy per batch.
++    No torch.compile to avoid Triton cache conflicts with the training compilation.
++    """
++    stride = stride if stride is not None else args.train_seq_len
++    seq_len = args.train_seq_len
++    if stride >= seq_len:
++        stride = seq_len
++    T = val_tokens.numel() - 1
++    # window i: x=val_tokens[i*stride : i*stride+seq_len], y=val_tokens[i*stride+1 : +seq_len+1]
++    # window 0 scores all seq_len positions; windows i>0 score last `stride` positions.
++    num_windows = (T - seq_len) // stride + 1
++    win_start = (num_windows * rank) // world_size
++    win_end = (num_windows * (rank + 1)) // world_size
++    val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
++    val_token_count = torch.zeros((), device=device, dtype=torch.float64)
++    val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
++    batch_windows = max(1, args.val_batch_size // (world_size * seq_len))
++    base_model.eval()
++    with torch.inference_mode():
++        for batch_start in range(win_start, win_end, batch_windows):
++            batch_end = min(batch_start + batch_windows, win_end)
++            wins = range(batch_start, batch_end)
++            B = batch_end - batch_start
++            x = torch.stack([val_tokens[w * stride : w * stride + seq_len].to(device=device, dtype=torch.int64) for w in wins])
++            y = torch.stack([val_tokens[w * stride + 1 : w * stride + seq_len + 1].to(device=device, dtype=torch.int64) for w in wins])
++            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
++                logits = base_model._forward_logits(x)  # (B, seq_len, V)
++            # Build boolean score mask: which positions contribute to the metric.
++            score_mask = torch.zeros(B, seq_len, device=device, dtype=torch.bool)
++            if wins[0] == 0:
++                score_mask[0, :] = True               # window 0: all positions
++                score_mask[1:, seq_len - stride:] = True
++            else:
++                score_mask[:, seq_len - stride:] = True
++            # Vectorized loss.
++            V = logits.size(-1)
++            per_tok_loss = F.cross_entropy(logits.reshape(-1, V).float(), y.reshape(-1), reduction="none").reshape(B, seq_len)
++            val_loss_sum += (per_tok_loss * score_mask).sum().detach().to(torch.float64)
++            val_token_count += score_mask.sum().to(torch.float64)
++            # Byte count.
++            tgt_ids = y[score_mask]
++            prev_ids = x[score_mask]
++            token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
++            token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
++            val_byte_count += token_bytes.to(torch.float64).sum()
++    base_model.train()
++    if dist.is_available() and dist.is_initialized():
++        dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
++        dist.all_reduce(val_token_count, op=dist.ReduceOp.SUM)
++        dist.all_reduce(val_byte_count, op=dist.ReduceOp.SUM)
++    val_loss = (val_loss_sum / val_token_count).item()
++    bits_per_token = val_loss / math.log(2.0)
++    tokens_per_byte = (val_token_count / val_byte_count).item()
++    return float(val_loss), float(bits_per_token * tokens_per_byte)
++
+ # -----------------------------
+ # POST-TRAINING QUANTIZATION
+ # -----------------------------
+@@ -306,6 +381,7 @@ INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
+ INT8_PER_ROW_SCALE_DTYPE = torch.float16
+ INT8_CLIP_PERCENTILE = 99.99984
+ INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
++GPTQ_LITE_PERCENTILES = [0.999, 0.9995, 0.9999, 0.99999, 1.0]
+ 
+ def tensor_nbytes(t: Tensor) -> int:
+     return int(t.numel()) * int(t.element_size())
+@@ -321,17 +397,26 @@ def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, s
+ def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
+     t32 = t.float()
+     if t32.ndim == 2:
+-        # Matrices get one scale per row, which usually tracks output-channel
+-        # ranges much better than a single tensor-wide scale.
+-        clip_abs = (
+-            torch.quantile(t32.abs(), INT8_CLIP_Q, dim=1)
+-            if t32.numel()
+-            else torch.empty((t32.shape[0],), dtype=torch.float32)
+-        )
+-        clipped = torch.maximum(torch.minimum(t32, clip_abs[:, None]), -clip_abs[:, None])
+-        scale = (clip_abs / 127.0).clamp_min(1.0 / 127.0)
+-        q = torch.clamp(torch.round(clipped / scale[:, None]), -127, 127).to(torch.int8).contiguous()
+-        return q, scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
++        # Matrices: try multiple clip percentiles per row, keep MSE-minimizing one (GPTQ-lite).
++        if t32.numel() == 0:
++            return (
++                torch.empty_like(t32, dtype=torch.int8).contiguous(),
++                torch.empty((t32.shape[0],), dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous(),
++            )
++        best_q: Tensor | None = None
++        best_scale: Tensor | None = None
++        best_mse = float("inf")
++        for pct in GPTQ_LITE_PERCENTILES:
++            clip_abs = t32.abs().max(dim=1).values if pct >= 1.0 else torch.quantile(t32.abs(), pct, dim=1)
++            clip_abs = clip_abs.clamp_min(1e-9)
++            scale = (clip_abs / 127.0).clamp_min(1.0 / 127.0)
++            q = torch.clamp(torch.round(t32.clamp(-clip_abs[:, None], clip_abs[:, None]) / scale[:, None]), -127, 127).to(torch.int8)
++            mse = float(((t32 - q.float() * scale[:, None]) ** 2).sum())
++            if mse < best_mse:
++                best_mse = mse
++                best_q = q.contiguous()
++                best_scale = scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
++        return best_q, best_scale  # type: ignore[return-value]
+ 
+     # Vectors / scalars use a simpler per-tensor scale.
+     clip_abs = float(torch.quantile(t32.abs().flatten(), INT8_CLIP_Q).item()) if t32.numel() else 0.0
+@@ -547,9 +632,35 @@ class Rotary(nn.Module):
+ 
+ 
+ def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
+-    half = x.size(-1) // 2
+-    x1, x2 = x[..., :half], x[..., half:]
+-    return torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
++    half = cos.size(-1)  # half of rotary dims
++    x_rope, x_pass = x[..., :2*half], x[..., 2*half:]
++    x1, x2 = x_rope[..., :half], x_rope[..., half:]
++    x_rot = torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
++    return torch.cat((x_rot, x_pass), dim=-1) if x_pass.shape[-1] > 0 else x_rot
++
++
++class BigramHashEmbedding(nn.Module):
++    """Adds bigram (previous-token, current-token) hash features to embeddings."""
++    def __init__(self, bigram_vocab_size: int, bigram_dim: int, model_dim: int):
++        super().__init__()
++        self.bigram_vocab_size = bigram_vocab_size
++        self.embed = nn.Embedding(bigram_vocab_size, bigram_dim)
++        self.proj = CastedLinear(bigram_dim, model_dim, bias=False) if bigram_dim != model_dim else None
++        self.scale = nn.Parameter(torch.tensor(0.05, dtype=torch.float32))
++
++    def bigram_hash(self, tokens: Tensor) -> Tensor:
++        t = tokens.to(torch.int32)
++        mod = self.bigram_vocab_size - 1
++        out = torch.empty_like(t)
++        out[..., 0] = mod
++        out[..., 1:] = torch.bitwise_xor(36313 * t[..., 1:], 27191 * t[..., :-1]) % mod
++        return out.long()
++
++    def forward(self, token_ids: Tensor) -> Tensor:
++        h = self.embed(self.bigram_hash(token_ids))
++        if self.proj is not None:
++            h = self.proj(h)
++        return h * self.scale.to(dtype=h.dtype)
+ 
+ 
+ class CausalSelfAttention(nn.Module):
+@@ -560,6 +671,7 @@ class CausalSelfAttention(nn.Module):
+         num_kv_heads: int,
+         rope_base: float,
+         qk_gain_init: float,
++        partial_rope_dims: int = 0,
+     ):
+         super().__init__()
+         if dim % num_heads != 0:
+@@ -578,7 +690,19 @@ class CausalSelfAttention(nn.Module):
+         self.proj = CastedLinear(dim, dim, bias=False)
+         self.proj._zero_init = True
+         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
+-        self.rotary = Rotary(self.head_dim, base=rope_base)
++        rope_dim = partial_rope_dims if partial_rope_dims > 0 else self.head_dim
++        self.rotary = Rotary(rope_dim, base=rope_base)
++        self.use_xsa = False
++
++    def _xsa_efficient(self, y: Tensor, v: Tensor) -> Tensor:
++        """Subtract self-value projection (GQA-aware). y: (B,T,H,D), v: (B,T,Hkv,D)."""
++        B, T, H, D = y.shape
++        Hkv = v.size(2)
++        group = H // Hkv
++        y_g = y.reshape(B, T, Hkv, group, D)
++        vn = F.normalize(v, dim=-1).unsqueeze(3)  # (B, T, Hkv, 1, D)
++        proj = (y_g * vn).sum(dim=-1, keepdim=True) * vn
++        return (y_g - proj).reshape(B, T, H, D)
+ 
+     def forward(self, x: Tensor) -> Tensor:
+         bsz, seqlen, dim = x.shape
+@@ -599,7 +723,10 @@ class CausalSelfAttention(nn.Module):
+             is_causal=True,
+             enable_gqa=(self.num_kv_heads != self.num_heads),
+         )
+-        y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
++        y = y.transpose(1, 2)  # (B, T, H, D)
++        if self.use_xsa:
++            y = self._xsa_efficient(y, v.transpose(1, 2))
++        y = y.contiguous().reshape(bsz, seqlen, dim)
+         return self.proj(y)
+ 
+ 
+@@ -626,11 +753,12 @@ class Block(nn.Module):
+         mlp_mult: int,
+         rope_base: float,
+         qk_gain_init: float,
++        partial_rope_dims: int = 0,
+     ):
+         super().__init__()
+         self.attn_norm = RMSNorm()
+         self.mlp_norm = RMSNorm()
+-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
++        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, partial_rope_dims)
+         self.mlp = MLP(dim, mlp_mult)
+         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+@@ -659,6 +787,10 @@ class GPT(nn.Module):
+         logit_softcap: float,
+         rope_base: float,
+         qk_gain_init: float,
++        xsa_last_n: int = 0,
++        partial_rope_dims: int = 0,
++        bigram_vocab_size: int = 0,
++        bigram_dim: int = 128,
+     ):
+         super().__init__()
+         if logit_softcap <= 0.0:
+@@ -667,6 +799,7 @@ class GPT(nn.Module):
+         self.tied_embed_init_std = tied_embed_init_std
+         self.logit_softcap = logit_softcap
+         self.tok_emb = nn.Embedding(vocab_size, model_dim)
++        self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim) if bigram_vocab_size > 0 else None
+         self.num_encoder_layers = num_layers // 2
+         self.num_decoder_layers = num_layers - self.num_encoder_layers
+         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
+@@ -680,10 +813,14 @@ class GPT(nn.Module):
+                     mlp_mult,
+                     rope_base,
+                     qk_gain_init,
++                    partial_rope_dims,
+                 )
+                 for i in range(num_layers)
+             ]
+         )
++        if xsa_last_n > 0:
++            for i in range(max(0, num_layers - xsa_last_n), num_layers):
++                self.blocks[i].attn.use_xsa = True
+         self.final_norm = RMSNorm()
+         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
+         if self.lm_head is not None:
+@@ -699,6 +836,8 @@ class GPT(nn.Module):
+ 
+     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+         x = self.tok_emb(input_ids)
++        if self.bigram is not None:
++            x = x + self.bigram(input_ids)
+         x = F.rms_norm(x, (x.size(-1),))
+         x0 = x
+         skips: list[Tensor] = []
+@@ -723,6 +862,30 @@ class GPT(nn.Module):
+         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+         return F.cross_entropy(logits.float(), targets, reduction="mean")
+ 
++    def _forward_logits(self, input_ids: Tensor) -> Tensor:
++        """Returns logits (B, T, V) without loss reduction. Used for sliding-window eval."""
++        x = self.tok_emb(input_ids)
++        if self.bigram is not None:
++            x = x + self.bigram(input_ids)
++        x = F.rms_norm(x, (x.size(-1),))
++        x0 = x
++        skips: list[Tensor] = []
++        for i in range(self.num_encoder_layers):
++            x = self.blocks[i](x, x0)
++            skips.append(x)
++        for i in range(self.num_decoder_layers):
++            if skips:
++                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
++            x = self.blocks[self.num_encoder_layers + i](x, x0)
++        x = self.final_norm(x)
++        if self.tie_embeddings:
++            logits_proj = F.linear(x, self.tok_emb.weight)
++        else:
++            if self.lm_head is None:
++                raise RuntimeError("lm_head required when tie_embeddings=False")
++            logits_proj = self.lm_head(x)
++        return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
++
+ 
+ # -----------------------------
+ # TRAINING
+@@ -835,6 +998,10 @@ def main() -> None:
+         logit_softcap=args.logit_softcap,
+         rope_base=args.rope_base,
+         qk_gain_init=args.qk_gain_init,
++        xsa_last_n=args.xsa_last_n,
++        partial_rope_dims=args.partial_rope_dims,
++        bigram_vocab_size=args.bigram_vocab_size,
++        bigram_dim=args.bigram_dim,
+     ).to(device).bfloat16()
+     for module in base_model.modules():
+         if isinstance(module, CastedLinear):
+@@ -861,9 +1028,15 @@ def main() -> None:
+     ]
+     if base_model.skip_weights.numel() > 0:
+         scalar_params.append(base_model.skip_weights)
++    if base_model.bigram is not None:
++        scalar_params.append(base_model.bigram.scale)
++        matrix_params.append(base_model.bigram.proj.weight)
+     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
++    tok_params = [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}]
++    if base_model.bigram is not None:
++        tok_params.append({"params": [base_model.bigram.embed.weight], "lr": token_lr, "base_lr": token_lr})
+     optimizer_tok = torch.optim.Adam(
+-        [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
++        tok_params,
+         betas=(args.beta1, args.beta2),
+         eps=args.adam_eps,
+         fused=True,
+@@ -969,6 +1142,10 @@ def main() -> None:
+     torch.cuda.synchronize()
+     t0 = time.perf_counter()
+ 
++    # SWA: accumulate running average of weights during warmdown phase.
++    swa_state: dict[str, Tensor] = {}
++    swa_n = 0
++
+     step = 0
+     while True:
+         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
+@@ -1033,6 +1210,16 @@ def main() -> None:
+             opt.step()
+         zero_grad_all()
+ 
++        # SWA accumulation during warmdown (scale < 1.0 means LR is being decayed).
++        if scale < 1.0:
++            swa_n += 1
++            with torch.no_grad():
++                for name, param in base_model.named_parameters():
++                    if name not in swa_state:
++                        swa_state[name] = param.data.clone()
++                    else:
++                        swa_state[name].lerp_(param.data, 1.0 / swa_n)
++
+         step += 1
+         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
+         should_log_train = (
+@@ -1059,6 +1246,14 @@ def main() -> None:
+         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
+     )
+ 
++    # Load SWA weights if we accumulated any during warmdown.
++    if swa_n > 0:
++        log0(f"swa: loading averaged weights from {swa_n} warmdown steps")
++        with torch.no_grad():
++            for name, param in base_model.named_parameters():
++                if name in swa_state:
++                    param.data.copy_(swa_state[name])
++
+     # -----------------------------
+     # SERIALIZATION + ROUNDTRIP VALIDATION
+     # -----------------------------
+@@ -1099,17 +1294,17 @@ def main() -> None:
+     base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
+     torch.cuda.synchronize()
+     t_qeval = time.perf_counter()
+-    q_val_loss, q_val_bpb = eval_val(
++    q_val_loss, q_val_bpb = eval_val_sliding(
+         args,
+-        model,
++        base_model,
+         rank,
+         world_size,
+         device,
+-        grad_accum_steps,
+         val_tokens,
+         base_bytes_lut,
+         has_leading_space_lut,
+         is_boundary_token_lut,
++        stride=args.eval_stride,
+     )
+     torch.cuda.synchronize()
+     log0(
